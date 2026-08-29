@@ -1,26 +1,26 @@
 ﻿import { useState } from 'preact/hooks';
 import { argon2idAsync } from '@noble/hashes/argon2.js';
-import { strFromU8, unzipSync } from 'fflate';
+import { createPortal } from 'preact/compat';
+import { strFromU8, unzipSync, type UnzipFileInfo } from 'fflate';
 import { BlobReader, Uint8ArrayWriter, ZipReader, configure as configureZipJs } from '@zip.js/zip.js';
-import { Archive, ArrowLeftRight, Download, FileJson, FileUp } from 'lucide-preact';
-import ConfirmDialog from '@/components/ConfirmDialog';
-import type { CiphersImportPayload } from '@/lib/api';
+import { Download, FileUp } from 'lucide-preact';
+import ConfirmDialog, { useDialogLifecycle } from '@/components/ConfirmDialog';
+import type { CiphersImportPayload } from '@/lib/api/vault';
 import {
   type EncryptedJsonMode,
   EXPORT_FORMATS,
-  type ExportDownloadPayload,
   type ExportFormatId,
   type ExportRequest,
 } from '@/lib/export-formats';
 import {
-  getFileAcceptBySource,
-  IMPORT_SOURCES,
-  type BitwardenJsonInput,
-  type ImportSourceId,
-  normalizeBitwardenEncryptedAccountImport,
-  normalizeBitwardenImport,
   parseImportPayloadBySource,
 } from '@/lib/import-formats';
+import { getFileAcceptBySource, IMPORT_SOURCES, type ImportSourceId } from '@/lib/import-format-sources';
+import {
+  type BitwardenJsonInput,
+  normalizeBitwardenEncryptedAccountImport,
+  normalizeBitwardenImport,
+} from '@/lib/import-formats-bitwarden';
 import { base64ToBytes, decryptStr, hkdfExpand, pbkdf2 } from '@/lib/crypto';
 import { t } from '@/lib/i18n';
 import type { Folder } from '@/lib/types';
@@ -48,13 +48,16 @@ interface ImportPageProps {
   accountKeys?: { encB64: string; macB64: string } | null;
   onNotify: (type: 'success' | 'error', text: string) => void;
   folders: Folder[];
-  onExport: (request: ExportRequest) => Promise<ExportDownloadPayload>;
+  onExport: (request: ExportRequest) => Promise<void>;
 }
 
 export interface ImportResultSummary {
   totalItems: number;
   folderCount: number;
   typeCounts: Array<{ label: string; count: number }>;
+  attachmentCount: number;
+  importedAttachmentCount: number;
+  failedAttachments: Array<{ fileName: string; reason: string }>;
 }
 
 interface BitwardenPasswordProtectedInput extends BitwardenJsonInput {
@@ -88,9 +91,16 @@ const COMMON_IMPORT_SOURCE_IDS: ImportSourceId[] = [
   'lastpass',
   'dashlane_csv',
   'dashlane_json',
+  'keepass_csv',
   'keepass_xml',
   'keepassx_csv',
 ];
+
+const MAX_IMPORT_ZIP_BYTES = 256 * 1024 * 1024;
+const MAX_IMPORT_ZIP_ENTRY_COUNT = 10_000;
+const MAX_IMPORT_TEXT_ENTRY_BYTES = 32 * 1024 * 1024;
+const MAX_IMPORT_ATTACHMENT_BYTES = 100 * 1024 * 1024;
+const MAX_IMPORT_ATTACHMENT_TOTAL_BYTES = 512 * 1024 * 1024;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object';
@@ -167,8 +177,85 @@ function isZipPayload(bytes: Uint8Array): boolean {
   return bytes.length >= 4 && bytes[0] === 0x50 && bytes[1] === 0x4b && bytes[2] === 0x03 && bytes[3] === 0x04;
 }
 
+function formatMiB(bytes: number): string {
+  return String(Math.floor(bytes / (1024 * 1024)));
+}
+
+function zipEntryName(rawName: unknown): string {
+  return String(rawName || '').trim().replace(/\\/g, '/');
+}
+
+function assertSafeZipEntryName(name: string): void {
+  if (!name || name.includes('\0') || name.startsWith('/') || name.includes('//')) {
+    throw new Error(t('txt_import_zip_unsafe_file_name'));
+  }
+  const parts = name.split('/');
+  if (parts.some((part) => part === '.' || part === '..')) {
+    throw new Error(t('txt_import_zip_unsafe_file_name'));
+  }
+}
+
+function assertImportZipSize(bytes: number): void {
+  if (bytes > MAX_IMPORT_ZIP_BYTES) {
+    throw new Error(t('txt_import_zip_too_large', { size: formatMiB(MAX_IMPORT_ZIP_BYTES) }));
+  }
+}
+
+function assertImportTextFileSize(bytes: number): void {
+  if (bytes > MAX_IMPORT_TEXT_ENTRY_BYTES) {
+    throw new Error(t('txt_import_file_too_large', { size: formatMiB(MAX_IMPORT_TEXT_ENTRY_BYTES) }));
+  }
+}
+
+function assertImportEntrySize(size: number, maxBytes: number): void {
+  if (size > maxBytes) {
+    throw new Error(t('txt_import_zip_entry_too_large', { size: formatMiB(maxBytes) }));
+  }
+}
+
+function isImportTextZipCandidate(source: ImportSourceId, name: string): boolean {
+  const lower = name.toLowerCase();
+  if (source === 'onepassword_1pux') {
+    return lower.endsWith('/export.data') || lower === 'export.data' || lower.endsWith('/export.json') || lower === 'export.json' || lower.endsWith('.json');
+  }
+  return lower.endsWith('/protonpass.json') || lower === 'protonpass.json' || lower.endsWith('/export.json') || lower === 'export.json' || lower.endsWith('.json');
+}
+
+function createImportTextZipFilter(source: ImportSourceId): (file: UnzipFileInfo) => boolean {
+  let entryCount = 0;
+  let totalTextBytes = 0;
+  return (entry: UnzipFileInfo): boolean => {
+    entryCount += 1;
+    if (entryCount > MAX_IMPORT_ZIP_ENTRY_COUNT) {
+      throw new Error(t('txt_import_zip_too_many_files'));
+    }
+    const name = zipEntryName(entry.name);
+    assertSafeZipEntryName(name);
+    if (!isImportTextZipCandidate(source, name)) return false;
+
+    const originalSize = Number(entry.originalSize);
+    if (!Number.isFinite(originalSize) || originalSize < 0) {
+      throw new Error(t('txt_import_zip_entry_too_large', { size: formatMiB(MAX_IMPORT_TEXT_ENTRY_BYTES) }));
+    }
+    assertImportEntrySize(originalSize, MAX_IMPORT_TEXT_ENTRY_BYTES);
+    totalTextBytes += originalSize;
+    if (totalTextBytes > MAX_IMPORT_TEXT_ENTRY_BYTES) {
+      throw new Error(t('txt_import_zip_expands_too_large', { size: formatMiB(MAX_IMPORT_TEXT_ENTRY_BYTES) }));
+    }
+    return true;
+  };
+}
+
 function readZipText(bytes: Uint8Array, source: ImportSourceId): string {
-  const unzipped = unzipSync(bytes);
+  assertImportZipSize(bytes.byteLength);
+  const unzippedRaw = unzipSync(bytes, { filter: createImportTextZipFilter(source) });
+  const unzipped: Record<string, Uint8Array> = {};
+  for (const [rawName, entryBytes] of Object.entries(unzippedRaw)) {
+    const name = zipEntryName(rawName);
+    assertSafeZipEntryName(name);
+    assertImportEntrySize(entryBytes.byteLength, MAX_IMPORT_TEXT_ENTRY_BYTES);
+    unzipped[name] = entryBytes;
+  }
   const fileNames = Object.keys(unzipped);
   if (!fileNames.length) throw new Error(t('txt_import_empty_zip_archive'));
 
@@ -185,10 +272,13 @@ function readZipText(bytes: Uint8Array, source: ImportSourceId): string {
 
 async function readImportText(file: File, source: ImportSourceId): Promise<string> {
   if (source !== 'onepassword_1pux' && source !== 'protonpass_json') {
+    assertImportTextFileSize(file.size);
     return file.text();
   }
+  assertImportZipSize(file.size);
   const bytes = new Uint8Array(await file.arrayBuffer());
   if (isZipPayload(bytes)) return readZipText(bytes, source);
+  assertImportTextFileSize(bytes.byteLength);
   return new TextDecoder().decode(bytes);
 }
 
@@ -207,34 +297,77 @@ function looksLikeZipPasswordError(error: unknown): boolean {
   return message.includes('password') || message.includes('encrypted');
 }
 
+function bitwardenZipAttachmentMatch(name: string): RegExpMatchArray | null {
+  return name.match(/^attachments\/([^/]+)\/(.+)$/i);
+}
+
+function zipJsEntrySize(entry: unknown): number | null {
+  const size = Number((entry as { uncompressedSize?: unknown })?.uncompressedSize);
+  return Number.isFinite(size) && size >= 0 ? size : null;
+}
+
+function validateBitwardenZipEntries(entries: Awaited<ReturnType<ZipReader<unknown>['getEntries']>>): void {
+  if (entries.length > MAX_IMPORT_ZIP_ENTRY_COUNT) {
+    throw new Error(t('txt_import_zip_too_many_files'));
+  }
+
+  let totalAttachmentBytes = 0;
+  for (const entry of entries) {
+    if (entry.directory) continue;
+    const name = zipEntryName(entry.filename);
+    assertSafeZipEntryName(name);
+    const lower = name.toLowerCase();
+    const size = zipJsEntrySize(entry);
+    if (lower === 'data.json' && size != null) {
+      assertImportEntrySize(size, MAX_IMPORT_TEXT_ENTRY_BYTES);
+    } else if (bitwardenZipAttachmentMatch(name) && size != null) {
+      assertImportEntrySize(size, MAX_IMPORT_ATTACHMENT_BYTES);
+      totalAttachmentBytes += size;
+      if (totalAttachmentBytes > MAX_IMPORT_ATTACHMENT_TOTAL_BYTES) {
+        throw new Error(t('txt_import_zip_expands_too_large', { size: formatMiB(MAX_IMPORT_ATTACHMENT_TOTAL_BYTES) }));
+      }
+    }
+  }
+}
+
 async function readBitwardenZipPayload(
   file: File,
   passwordRaw: string
 ): Promise<{ jsonText: string; attachments: ImportAttachmentFile[] }> {
   const password = String(passwordRaw || '').trim();
+  assertImportZipSize(file.size);
   const reader = new ZipReader(new BlobReader(file), { useWebWorkers: false });
   try {
     const entries = await reader.getEntries();
     if (!entries.length) throw new Error(t('txt_import_empty_zip_archive'));
+    validateBitwardenZipEntries(entries);
 
     let jsonText = '';
+    let totalAttachmentBytes = 0;
     const attachments: ImportAttachmentFile[] = [];
     const options = password ? { password } : undefined;
 
     for (const entry of entries) {
       if (entry.directory) continue;
-      const name = String(entry.filename || '').trim().replace(/\\/g, '/');
+      const name = zipEntryName(entry.filename);
       if (!name) continue;
+      assertSafeZipEntryName(name);
 
       const bytes = await entry.getData(new Uint8ArrayWriter(), options);
       const lower = name.toLowerCase();
       if (lower === 'data.json') {
+        assertImportEntrySize(bytes.byteLength, MAX_IMPORT_TEXT_ENTRY_BYTES);
         jsonText = new TextDecoder().decode(bytes);
         continue;
       }
 
-      const attachmentMatch = name.match(/^attachments\/([^/]+)\/(.+)$/i);
+      const attachmentMatch = bitwardenZipAttachmentMatch(name);
       if (!attachmentMatch) continue;
+      assertImportEntrySize(bytes.byteLength, MAX_IMPORT_ATTACHMENT_BYTES);
+      totalAttachmentBytes += bytes.byteLength;
+      if (totalAttachmentBytes > MAX_IMPORT_ATTACHMENT_TOTAL_BYTES) {
+        throw new Error(t('txt_import_zip_expands_too_large', { size: formatMiB(MAX_IMPORT_ATTACHMENT_TOTAL_BYTES) }));
+      }
       const sourceCipherId = String(attachmentMatch[1] || '').trim() || null;
       const fileName = String(attachmentMatch[2] || '').trim() || 'attachment.bin';
       attachments.push({
@@ -309,6 +442,8 @@ export default function ImportPage({ onImport, onImportEncryptedRaw, accountKeys
   const [exportAuthDialogOpen, setExportAuthDialogOpen] = useState(false);
   const [exportAuthPassword, setExportAuthPassword] = useState('');
   const [importSummary, setImportSummary] = useState<ImportResultSummary | null>(null);
+
+  useDialogLifecycle(!!importSummary, importSummary ? () => setImportSummary(null) : null);
   const commonSourceSet = new Set<ImportSourceId>(COMMON_IMPORT_SOURCE_IDS);
   const commonSources = IMPORT_SOURCES.filter((item) => commonSourceSet.has(item.id as ImportSourceId));
   const otherSources = IMPORT_SOURCES.filter((item) => !commonSourceSet.has(item.id as ImportSourceId));
@@ -463,6 +598,7 @@ export default function ImportPage({ onImport, onImportEncryptedRaw, accountKeys
   }
 
   async function handlePasswordImportConfirm() {
+    if (isPasswordSubmitting) return;
     if (!pendingPasswordImport) return;
     setIsPasswordSubmitting(true);
     try {
@@ -481,6 +617,7 @@ export default function ImportPage({ onImport, onImportEncryptedRaw, accountKeys
   }
 
   async function handleZipPasswordImportConfirm() {
+    if (isZipPasswordSubmitting) return;
     if (!pendingZipFile) return;
     setIsZipPasswordSubmitting(true);
     try {
@@ -536,23 +673,13 @@ export default function ImportPage({ onImport, onImportEncryptedRaw, accountKeys
 
     setIsExporting(true);
     try {
-      const payload = await onExport({
+      await onExport({
         format: exportFormat,
         encryptedJsonMode: exportNeedsMode ? encryptedJsonMode : undefined,
         filePassword,
         zipPassword: exportIsZip ? zipPass : '',
         masterPassword,
       });
-      const blobBytes = Uint8Array.from(payload.bytes);
-      const blob = new Blob([blobBytes], { type: payload.mimeType });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = payload.fileName;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(url);
       onNotify('success', t('txt_export_completed'));
     } catch (error) {
       const message = error instanceof Error ? error.message : t('txt_export_failed');
@@ -563,6 +690,7 @@ export default function ImportPage({ onImport, onImportEncryptedRaw, accountKeys
   }
 
   async function handleExportConfirmPassword() {
+    if (isExporting) return;
     const masterPassword = String(exportAuthPassword || '').trim();
     if (!masterPassword) {
       onNotify('error', t('txt_master_password_is_required'));
@@ -582,46 +710,10 @@ export default function ImportPage({ onImport, onImportEncryptedRaw, accountKeys
 
   return (
     <div className="import-export-page">
-      <section className="card import-export-hero">
-        <h3>{t('txt_import_export_title')}</h3>
-        <p className="import-export-hero-sub">{t('txt_import_export_feature_intro')}</p>
-        <div className="import-export-feature-grid">
-          <article className="import-export-feature-item">
-            <span className="import-export-feature-icon">
-              <Archive size={16} />
-            </span>
-            <div>
-              <strong>{t('txt_import_export_feature_bw_zip_title')}</strong>
-              <p>{t('txt_import_export_feature_bw_zip_desc')}</p>
-            </div>
-          </article>
-          <article className="import-export-feature-item">
-            <span className="import-export-feature-icon">
-              <FileJson size={16} />
-            </span>
-            <div>
-              <strong>{t('txt_import_export_feature_nodewarden_json_title')}</strong>
-              <p>{t('txt_import_export_feature_nodewarden_json_desc')}</p>
-            </div>
-          </article>
-          <article className="import-export-feature-item">
-            <span className="import-export-feature-icon">
-              <ArrowLeftRight size={16} />
-            </span>
-            <div>
-              <strong>{t('txt_import_export_feature_compat_title')}</strong>
-              <p>{t('txt_import_export_feature_compat_desc')}</p>
-            </div>
-          </article>
-        </div>
-      </section>
-
       <div className="import-export-panels">
       <section className="card import-export-panel">
         <h3>{t('txt_import')}</h3>
-        <p className="muted" style={{ textAlign: 'left', marginBottom: 12 }}>
-          {t('txt_import_vault_data_hint')}
-        </p>
+        <p className="backup-inline-note">{t('txt_import_vault_data_hint')}</p>
         <div className="field-grid">
           <label className="field field-span-2">
             <span>{t('txt_format')}</span>
@@ -702,9 +794,7 @@ export default function ImportPage({ onImport, onImportEncryptedRaw, accountKeys
 
       <section className="card import-export-panel">
         <h3>{t('txt_export')}</h3>
-        <p className="muted" style={{ textAlign: 'left', marginBottom: 12 }}>
-          {t('txt_export_vault_data_hint')}
-        </p>
+        <p className="backup-inline-note">{t('txt_export_vault_data_hint')}</p>
         <div className="field-grid">
           <label className="field field-span-2">
             <span>{t('txt_format')}</span>
@@ -779,6 +869,8 @@ export default function ImportPage({ onImport, onImportEncryptedRaw, accountKeys
         confirmText={isExporting ? t('txt_loading') : t('txt_verify')}
         cancelText={t('txt_cancel')}
         showIcon={false}
+        confirmDisabled={isExporting}
+        cancelDisabled={isExporting}
         onConfirm={() => void handleExportConfirmPassword()}
         onCancel={() => {
           if (isExporting) return;
@@ -804,6 +896,8 @@ export default function ImportPage({ onImport, onImportEncryptedRaw, accountKeys
         confirmText={isPasswordSubmitting ? t('txt_loading') : t('txt_import')}
         cancelText={t('txt_cancel')}
         showIcon={false}
+        confirmDisabled={isPasswordSubmitting}
+        cancelDisabled={isPasswordSubmitting}
         onConfirm={() => void handlePasswordImportConfirm()}
         onCancel={() => {
           if (isPasswordSubmitting) return;
@@ -830,6 +924,8 @@ export default function ImportPage({ onImport, onImportEncryptedRaw, accountKeys
         confirmText={isZipPasswordSubmitting ? t('txt_loading') : t('txt_import')}
         cancelText={t('txt_cancel')}
         showIcon={false}
+        confirmDisabled={isZipPasswordSubmitting}
+        cancelDisabled={isZipPasswordSubmitting}
         onConfirm={() => void handleZipPasswordImportConfirm()}
         onCancel={() => {
           if (isZipPasswordSubmitting) return;
@@ -849,9 +945,15 @@ export default function ImportPage({ onImport, onImportEncryptedRaw, accountKeys
         </label>
       </ConfirmDialog>
 
-      {importSummary && (
-        <div className="dialog-mask">
-          <section className="dialog-card import-summary-dialog">
+      {importSummary && typeof document !== 'undefined' ? createPortal((
+        <div
+          className="dialog-mask"
+          onClick={(event) => {
+            if (event.target !== event.currentTarget) return;
+            setImportSummary(null);
+          }}
+        >
+          <section className="dialog-card import-summary-dialog" role="dialog" aria-modal="true" aria-label={t('txt_import_success')}>
             <button
               type="button"
               className="import-summary-close"
@@ -862,6 +964,29 @@ export default function ImportPage({ onImport, onImportEncryptedRaw, accountKeys
             </button>
             <h3 className="dialog-title">{t('txt_import_success')}</h3>
             <div className="dialog-message">{t('txt_import_success_number_of_items', { count: importSummary.totalItems })}</div>
+            {importSummary.attachmentCount > 0 && (
+              <div className="dialog-message">
+                {t('txt_import_attachment_summary', {
+                  imported: String(importSummary.importedAttachmentCount),
+                  total: String(importSummary.attachmentCount),
+                })}
+              </div>
+            )}
+            {importSummary.failedAttachments.length > 0 && (
+              <div className="import-summary-failed-list">
+                <div className="import-summary-failed-title">
+                  {t('txt_import_failed_attachments_title', { count: String(importSummary.failedAttachments.length) })}
+                </div>
+                <ul>
+                  {importSummary.failedAttachments.map((row, index) => (
+                    <li key={`${row.fileName}-${index}`}>
+                      <strong>{row.fileName}</strong>
+                      {`: ${row.reason}`}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
             <div className="import-summary-table-wrap">
               <table className="import-summary-table">
                 <thead>
@@ -889,7 +1014,7 @@ export default function ImportPage({ onImport, onImportEncryptedRaw, accountKeys
             </button>
           </section>
         </div>
-      )}
+      ), document.body) : null}
     </div>
   );
 }

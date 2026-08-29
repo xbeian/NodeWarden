@@ -1,9 +1,11 @@
 import { Env, Cipher, Folder, CipherType } from '../types';
+import { notifyUserVaultSync } from '../durable/notifications-hub';
 import { StorageService } from '../services/storage';
 import { errorResponse, jsonResponse } from '../utils/response';
+import { readActingDeviceIdentifier } from '../utils/device';
 import { generateUUID } from '../utils/uuid';
 import { LIMITS } from '../config/limits';
-import { normalizeCipherLoginForCompatibility, normalizeCipherSshKeyForCompatibility } from './ciphers';
+import { normalizeCipherLoginForStorage, normalizeCipherSshKeyForCompatibility, validateCipherEncryptedFieldsForCompatibility } from './ciphers';
 
 // Bitwarden client import request format
 interface CiphersImportRequest {
@@ -15,14 +17,16 @@ interface CiphersImportRequest {
     favorite?: boolean;
     reprompt?: number;
     sshKey?: any | null;
+    bankAccount?: any | null;
+    driversLicense?: any | null;
+    passport?: any | null;
     key?: string | null;
     login?: {
-      uris?: Array<{ uri: string | null; match?: number | null }> | null;
+      uris?: Array<{ uri: string | null; uriChecksum?: string | null; match?: number | null }> | null;
       username?: string | null;
       password?: string | null;
       totp?: string | null;
       autofillOnPageLoad?: boolean | null;
-      fido2Credentials?: any[] | null;
       uri?: string | null;
       passwordRevisionDate?: string | null;
       [key: string]: any;
@@ -81,6 +85,22 @@ function bindNull(v: any): any {
   return v === undefined ? null : v;
 }
 
+function readAliasedImportProp<T = unknown>(source: any, aliases: string[]): T | undefined {
+  if (!source || typeof source !== 'object') return undefined;
+  for (const key of aliases) {
+    if (Object.prototype.hasOwnProperty.call(source, key)) {
+      return source[key] as T;
+    }
+  }
+  return undefined;
+}
+
+function normalizeOptionalId(value: unknown): string | null {
+  if (value == null) return null;
+  const normalized = String(value).trim();
+  return normalized ? normalized : null;
+}
+
 async function runBatchInChunks(db: D1Database, statements: D1PreparedStatement[], chunkSize: number): Promise<void> {
   for (let i = 0; i < statements.length; i += chunkSize) {
     const chunk = statements.slice(i, i + chunkSize);
@@ -101,9 +121,9 @@ export async function handleCiphersImport(request: Request, env: Env, userId: st
     return errorResponse('Invalid JSON', 400);
   }
 
-  const folders = importData.folders || [];
-  const ciphers = importData.ciphers || [];
-  const folderRelationships = importData.folderRelationships || [];
+  const folders = Array.isArray(importData.folders) ? importData.folders : [];
+  const ciphers = Array.isArray(importData.ciphers) ? importData.ciphers : [];
+  const folderRelationships = Array.isArray(importData.folderRelationships) ? importData.folderRelationships : [];
 
   if (folders.length + ciphers.length > LIMITS.performance.importItemLimit) {
     return errorResponse(`Import exceeds maximum of ${LIMITS.performance.importItemLimit} items`, 400);
@@ -117,13 +137,14 @@ export async function handleCiphersImport(request: Request, env: Env, userId: st
   const folderRows: Folder[] = [];
   
   for (let i = 0; i < folders.length; i++) {
+    const importedFolder = folders[i] && typeof folders[i] === 'object' ? folders[i] : null;
     const folderId = generateUUID();
     folderIdMap.set(i, folderId);
 
     const folder: Folder = {
       id: folderId,
       userId: userId,
-      name: folders[i].name,
+      name: typeof importedFolder?.name === 'string' && importedFolder.name ? importedFolder.name : 'Folder',
       createdAt: now,
       updatedAt: now,
     };
@@ -146,20 +167,34 @@ export async function handleCiphersImport(request: Request, env: Env, userId: st
   // Build cipher index -> folder id mapping from relationships
   const cipherFolderMap = new Map<number, string>();
   for (const rel of folderRelationships) {
+    if (!rel || typeof rel !== 'object') continue;
     const folderId = folderIdMap.get(rel.value);
     if (folderId) {
       cipherFolderMap.set(rel.key, folderId);
     }
   }
+  const existingFolderIds = new Set((await storage.getAllFolders(userId)).map((folder) => folder.id));
 
   // Create ciphers
   const cipherRows: Cipher[] = [];
   const cipherMapRows: Array<{ index: number; sourceId: string | null; id: string }> = [];
   for (let i = 0; i < ciphers.length; i++) {
-    const c = ciphers[i];
-    const folderId = cipherFolderMap.get(i) || null;
+    const c = ciphers[i] && typeof ciphers[i] === 'object' ? ciphers[i] : {} as CiphersImportRequest['ciphers'][number];
+    const importedFolderId = normalizeOptionalId(readAliasedImportProp<string | null>(c, ['folderId', 'FolderId']));
+    const folderId = cipherFolderMap.get(i) || (importedFolderId && existingFolderIds.has(importedFolderId) ? importedFolderId : null);
     const sourceIdRaw = String(c?.id ?? '').trim();
     const sourceId = sourceIdRaw || null;
+    const login = readAliasedImportProp<any | null>(c, ['login', 'Login']);
+    const card = readAliasedImportProp<any | null>(c, ['card', 'Card']);
+    const identity = readAliasedImportProp<any | null>(c, ['identity', 'Identity']);
+    const secureNote = readAliasedImportProp<any | null>(c, ['secureNote', 'SecureNote']);
+    const sshKey = readAliasedImportProp<any | null>(c, ['sshKey', 'SshKey']);
+    const bankAccount = readAliasedImportProp<any | null>(c, ['bankAccount', 'BankAccount']);
+    const driversLicense = readAliasedImportProp<any | null>(c, ['driversLicense', 'DriversLicense']);
+    const passport = readAliasedImportProp<any | null>(c, ['passport', 'Passport']);
+    const fields = readAliasedImportProp<any[] | null>(c, ['fields', 'Fields']);
+    const passwordHistory = readAliasedImportProp<any[] | null>(c, ['passwordHistory', 'PasswordHistory']);
+    const key = readAliasedImportProp<string | null>(c, ['key', 'Key']);
 
     const cipher: Cipher = {
       ...c,
@@ -170,69 +205,77 @@ export async function handleCiphersImport(request: Request, env: Env, userId: st
       name: c.name ?? 'Untitled',
       notes: c.notes ?? null,
       favorite: c.favorite ?? false,
-      login: c.login ? {
-        ...c.login,
-        username: c.login.username ?? null,
-        password: c.login.password ?? null,
-        uris: c.login.uris?.map(u => ({
+      login: login ? {
+        ...login,
+        username: login.username ?? null,
+        password: login.password ?? null,
+        uris: login.uris?.map((u: any) => ({
           ...u,
           uri: u.uri ?? null,
-          uriChecksum: null,
+          uriChecksum: u.uriChecksum ?? null,
           match: u.match ?? null,
         })) || null,
-        totp: c.login.totp ?? null,
-        autofillOnPageLoad: c.login.autofillOnPageLoad ?? null,
-        fido2Credentials: c.login.fido2Credentials ?? null,
-        uri: c.login.uri ?? null,
-        passwordRevisionDate: c.login.passwordRevisionDate ?? null,
+        totp: login.totp ?? null,
+        autofillOnPageLoad: login.autofillOnPageLoad ?? null,
+        fido2Credentials: Array.isArray(login.fido2Credentials) ? login.fido2Credentials : null,
+        uri: login.uri ?? null,
+        passwordRevisionDate: login.passwordRevisionDate ?? null,
       } : null,
-      card: c.card ? {
-        ...c.card,
-        cardholderName: c.card.cardholderName ?? null,
-        brand: c.card.brand ?? null,
-        number: c.card.number ?? null,
-        expMonth: c.card.expMonth ?? null,
-        expYear: c.card.expYear ?? null,
-        code: c.card.code ?? null,
+      card: card ? {
+        ...card,
+        cardholderName: card.cardholderName ?? null,
+        brand: card.brand ?? null,
+        number: card.number ?? null,
+        expMonth: card.expMonth ?? null,
+        expYear: card.expYear ?? null,
+        code: card.code ?? null,
       } : null,
-      identity: c.identity ? {
-        ...c.identity,
-        title: c.identity.title ?? null,
-        firstName: c.identity.firstName ?? null,
-        middleName: c.identity.middleName ?? null,
-        lastName: c.identity.lastName ?? null,
-        address1: c.identity.address1 ?? null,
-        address2: c.identity.address2 ?? null,
-        address3: c.identity.address3 ?? null,
-        city: c.identity.city ?? null,
-        state: c.identity.state ?? null,
-        postalCode: c.identity.postalCode ?? null,
-        country: c.identity.country ?? null,
-        company: c.identity.company ?? null,
-        email: c.identity.email ?? null,
-        phone: c.identity.phone ?? null,
-        ssn: c.identity.ssn ?? null,
-        username: c.identity.username ?? null,
-        passportNumber: c.identity.passportNumber ?? null,
-        licenseNumber: c.identity.licenseNumber ?? null,
+      identity: identity ? {
+        ...identity,
+        title: identity.title ?? null,
+        firstName: identity.firstName ?? null,
+        middleName: identity.middleName ?? null,
+        lastName: identity.lastName ?? null,
+        address1: identity.address1 ?? null,
+        address2: identity.address2 ?? null,
+        address3: identity.address3 ?? null,
+        city: identity.city ?? null,
+        state: identity.state ?? null,
+        postalCode: identity.postalCode ?? null,
+        country: identity.country ?? null,
+        company: identity.company ?? null,
+        email: identity.email ?? null,
+        phone: identity.phone ?? null,
+        ssn: identity.ssn ?? null,
+        username: identity.username ?? null,
+        passportNumber: identity.passportNumber ?? null,
+        licenseNumber: identity.licenseNumber ?? null,
       } : null,
-      secureNote: c.secureNote ?? null,
-      fields: c.fields?.map(f => ({
+      secureNote: secureNote ?? null,
+      fields: fields?.map((f: any) => ({
         ...f,
         name: f.name ?? null,
         value: f.value ?? null,
         type: f.type,
         linkedId: f.linkedId ?? null,
       })) || null,
-      passwordHistory: c.passwordHistory ?? null,
+      passwordHistory: passwordHistory ?? null,
       reprompt: c.reprompt ?? 0,
-      sshKey: normalizeCipherSshKeyForCompatibility((c as any).sshKey ?? null),
-      key: (c as any).key ?? null,
+      sshKey: normalizeCipherSshKeyForCompatibility(sshKey ?? null),
+      bankAccount: bankAccount ?? null,
+      driversLicense: driversLicense ?? null,
+      passport: passport ?? null,
+      key: key ?? null,
       createdAt: now,
       updatedAt: now,
+      archivedAt: null,
       deletedAt: null,
     };
-    cipher.login = normalizeCipherLoginForCompatibility(cipher.login);
+    cipher.login = normalizeCipherLoginForStorage(cipher.login);
+    const compatibilityError = validateCipherEncryptedFieldsForCompatibility(cipher);
+    if (compatibilityError) {
+      return errorResponse(`Cipher ${i + 1}: ${compatibilityError}`, 400);
+    }
 
     cipherRows.push(cipher);
     cipherMapRows.push({ index: i, sourceId, id: cipher.id });
@@ -243,10 +286,10 @@ export async function handleCiphersImport(request: Request, env: Env, userId: st
       const data = JSON.stringify(cipher);
       return env.DB
         .prepare(
-          'INSERT INTO ciphers(id, user_id, type, folder_id, name, notes, favorite, data, reprompt, key, created_at, updated_at, deleted_at) ' +
-          'VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ' +
+          'INSERT INTO ciphers(id, user_id, type, folder_id, name, notes, favorite, data, reprompt, key, created_at, updated_at, archived_at, deleted_at) ' +
+          'VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ' +
           'ON CONFLICT(id) DO UPDATE SET ' +
-          'user_id=excluded.user_id, type=excluded.type, folder_id=excluded.folder_id, name=excluded.name, notes=excluded.notes, favorite=excluded.favorite, data=excluded.data, reprompt=excluded.reprompt, key=excluded.key, updated_at=excluded.updated_at, deleted_at=excluded.deleted_at'
+          'user_id=excluded.user_id, type=excluded.type, folder_id=excluded.folder_id, name=excluded.name, notes=excluded.notes, favorite=excluded.favorite, data=excluded.data, reprompt=excluded.reprompt, key=excluded.key, updated_at=excluded.updated_at, archived_at=excluded.archived_at, deleted_at=excluded.deleted_at'
         )
         .bind(
           cipher.id,
@@ -261,6 +304,7 @@ export async function handleCiphersImport(request: Request, env: Env, userId: st
           bindNull(cipher.key),
           cipher.createdAt,
           cipher.updatedAt,
+          bindNull(cipher.archivedAt),
           bindNull(cipher.deletedAt)
         );
     });
@@ -268,7 +312,8 @@ export async function handleCiphersImport(request: Request, env: Env, userId: st
   }
 
   // Update revision date
-  await storage.updateRevisionDate(userId);
+  const revisionDate = await storage.updateRevisionDate(userId);
+  notifyUserVaultSync(env, userId, revisionDate, readActingDeviceIdentifier(request));
 
   if (returnCipherMap) {
     return jsonResponse({

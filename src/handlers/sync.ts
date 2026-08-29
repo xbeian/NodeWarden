@@ -1,40 +1,47 @@
 import { Env, SyncResponse, CipherResponse, FolderResponse, ProfileResponse } from '../types';
 import { StorageService } from '../services/storage';
 import { errorResponse } from '../utils/response';
-import { cipherToResponse } from './ciphers';
+import { cipherToResponse, isCipherResponseSyncCompatible, shouldPreserveRepairableCipherUris } from './ciphers';
 import { sendToResponse } from './sends';
 import { LIMITS } from '../config/limits';
+import {
+  buildUserDecryptionCompat,
+  buildUserDecryptionOptions,
+} from '../utils/user-decryption';
+import { buildDomainsResponse } from '../services/domain-rules';
+import { buildWebAuthnPrfOption } from '../utils/account-passkeys';
+import { buildProfileResponse } from '../utils/profile-response';
 
-interface SyncCacheEntry {
-  body: string;
-  expiresAt: number;
+// CONTRACT:
+// /api/sync reuses cipherToResponse() as the single cipher response shaper.
+// Filtering invalid cipher responses here protects clients from stored rows that
+// would otherwise make official apps fail after an HTTP 200 sync.
+// Keep this aligned with src/handlers/ciphers.ts when adding new vault fields.
+function buildSyncCacheRequest(
+  request: Request,
+  userId: string,
+  revisionDate: string,
+  accountPasskeyCacheTag: string,
+  excludeDomains: boolean,
+  excludeSends: boolean,
+  preserveRepairableUris: boolean
+): Request {
+  const url = new URL(request.url);
+  const cacheUrl = new URL(
+    `/__nodewarden/cache/sync/${encodeURIComponent(userId)}/${encodeURIComponent(revisionDate)}/${encodeURIComponent(accountPasskeyCacheTag)}/${excludeDomains ? '1' : '0'}/${excludeSends ? '1' : '0'}/${preserveRepairableUris ? '1' : '0'}`,
+    url.origin
+  );
+  return new Request(cacheUrl.toString(), { method: 'GET' });
 }
 
-const syncResponseCache = new Map<string, SyncCacheEntry>();
-
-function buildSyncCacheKey(userId: string, revisionDate: string, excludeDomains: boolean): string {
-  return `${userId}:${revisionDate}:${excludeDomains ? '1' : '0'}`;
-}
-
-function readSyncCache(key: string): string | null {
-  const hit = syncResponseCache.get(key);
+async function readSyncCache(cacheRequest: Request): Promise<Response | null> {
+  const hit = await caches.default.match(cacheRequest);
   if (!hit) return null;
-  if (hit.expiresAt <= Date.now()) {
-    syncResponseCache.delete(key);
-    return null;
-  }
-  return hit.body;
+  return new Response(hit.body, hit);
 }
 
-function writeSyncCache(key: string, body: string): void {
-  if (syncResponseCache.size >= LIMITS.cache.syncResponseMaxEntries) {
-    const oldestKey = syncResponseCache.keys().next().value as string | undefined;
-    if (oldestKey) syncResponseCache.delete(oldestKey);
-  }
-  syncResponseCache.set(key, {
-    body,
-    expiresAt: Date.now() + LIMITS.cache.syncResponseTtlMs,
-  });
+async function writeSyncCache(cacheRequest: Request, response: Response): Promise<void> {
+  await caches.default.put(cacheRequest, response.clone());
 }
 
 // GET /api/sync
@@ -43,120 +50,105 @@ export async function handleSync(request: Request, env: Env, userId: string): Pr
   const url = new URL(request.url);
   const excludeDomainsParam = url.searchParams.get('excludeDomains');
   const excludeDomains = excludeDomainsParam !== null && /^(1|true|yes)$/i.test(excludeDomainsParam);
-  
+  const excludeSendsParam = url.searchParams.get('excludeSends');
+  const excludeSends = excludeSendsParam !== null && /^(1|true|yes)$/i.test(excludeSendsParam);
+  const preserveRepairableUris = shouldPreserveRepairableCipherUris(request);
+
   const user = await storage.getUserById(userId);
   if (!user) {
     return errorResponse('User not found', 404);
   }
 
-  const revisionDate = await storage.getRevisionDate(userId);
-  const cacheKey = buildSyncCacheKey(userId, revisionDate, excludeDomains);
-  const cachedBody = readSyncCache(cacheKey);
-  if (cachedBody) {
-    return new Response(cachedBody, {
-      status: 200,
-      headers: { 'Content-Type': 'application/json' },
+  const [revisionDate, accountPasskeys] = await Promise.all([
+    storage.getRevisionDate(userId),
+    storage.getAccountPasskeyCredentialsByUserId(userId),
+  ]);
+  const accountPasskeyCacheTag = accountPasskeys
+    .map((credential) => [
+      credential.id,
+      credential.updatedAt,
+      credential.supportsPrf ? '1' : '0',
+      credential.encryptedUserKey && credential.encryptedPublicKey && credential.encryptedPrivateKey ? '1' : '0',
+    ].join(':'))
+    .join(',');
+  const cacheRequest = buildSyncCacheRequest(request, userId, revisionDate, accountPasskeyCacheTag, excludeDomains, excludeSends, preserveRepairableUris);
+  const cachedResponse = await readSyncCache(cacheRequest);
+  if (cachedResponse) {
+    return cachedResponse;
+  }
+
+  const [ciphers, folders, sends, attachmentsByCipher, domainSettings] = await Promise.all([
+    storage.getAllCiphers(userId),
+    storage.getAllFolders(userId),
+    excludeSends ? Promise.resolve([]) : storage.getAllSends(userId),
+    storage.getAttachmentsByUserId(userId),
+    excludeDomains ? Promise.resolve(null) : storage.getUserDomainSettings(userId),
+  ]);
+  const webAuthnPrfOptions = accountPasskeys
+    .map(buildWebAuthnPrfOption)
+    .filter((option): option is NonNullable<typeof option> => !!option);
+  const userDecryptionOptions = buildUserDecryptionOptions(user, webAuthnPrfOptions[0] || null);
+  const validFolderIds = new Set(folders.map((folder) => folder.id));
+
+  const profile: ProfileResponse = buildProfileResponse(user, env);
+
+  const cipherResponses: CipherResponse[] = [];
+  for (const cipher of ciphers) {
+    const response = cipherToResponse(cipher, attachmentsByCipher.get(cipher.id) || [], { preserveRepairableUris, validFolderIds });
+    if (isCipherResponseSyncCompatible(response)) {
+      cipherResponses.push(response);
+    }
+  }
+
+  const folderResponses: FolderResponse[] = [];
+  for (const folder of folders) {
+    folderResponses.push({
+      id: folder.id,
+      name: folder.name,
+      revisionDate: folder.updatedAt,
+      creationDate: folder.createdAt,
+      object: 'folder',
     });
   }
 
-  const ciphers = await storage.getAllCiphers(userId);
-  const folders = await storage.getAllFolders(userId);
-  const sends = await storage.getAllSends(userId);
-  const attachmentsByCipher = await storage.getAttachmentsByUserId(userId);
-
-  // Build profile response
-  const profile: ProfileResponse = {
-    id: user.id,
-    name: user.name,
-    email: user.email,
-    emailVerified: true,
-    premium: true,
-    premiumFromOrganization: false,
-    usesKeyConnector: false,
-    masterPasswordHint: null,
-    culture: 'en-US',
-    twoFactorEnabled: !!user.totpSecret,
-    key: user.key,
-    privateKey: user.privateKey,
-    accountKeys: null,
-    securityStamp: user.securityStamp || user.id,
-    organizations: [],
-    providers: [],
-    providerOrganizations: [],
-    forcePasswordReset: false,
-    avatarColor: null,
-    creationDate: user.createdAt,
-    object: 'profile',
-  };
-
-  // Build cipher responses with attachments
-  const cipherResponses: CipherResponse[] = [];
-  for (const cipher of ciphers) {
-    const attachments = attachmentsByCipher.get(cipher.id) || [];
-    cipherResponses.push(cipherToResponse(cipher, attachments));
-  }
-
-  // Build folder responses
-  const folderResponses: FolderResponse[] = folders.map(folder => ({
-    id: folder.id,
-    name: folder.name,
-    revisionDate: folder.updatedAt,
-    object: 'folder',
-  }));
-
+  const sendResponses = sends.map(sendToResponse);
   const syncResponse: SyncResponse = {
-    profile: profile,
+    profile,
     folders: folderResponses,
     collections: [],
     ciphers: cipherResponses,
     domains: excludeDomains
       ? null
-      : {
-          equivalentDomains: [],
-          globalEquivalentDomains: [],
-          object: 'domains',
-        },
+      : buildDomainsResponse(
+          domainSettings?.equivalentDomains || [],
+          domainSettings?.customEquivalentDomains || [],
+          domainSettings?.excludedGlobalEquivalentDomains || [],
+          { omitExcludedGlobals: true }
+        ),
     policies: [],
-    sends: sends.map(sendToResponse),
-    // PascalCase for desktop/browser clients
-    UserDecryptionOptions: {
-      HasMasterPassword: true,
-      Object: 'userDecryptionOptions',
-      MasterPasswordUnlock: {
-        Kdf: {
-          KdfType: user.kdfType,
-          Iterations: user.kdfIterations,
-          Memory: user.kdfMemory || null,
-          Parallelism: user.kdfParallelism || null,
-        },
-        MasterKeyEncryptedUserKey: user.key,
-        MasterKeyWrappedUserKey: user.key,
-        Salt: user.email.toLowerCase(),
-        Object: 'masterPasswordUnlock',
-      },
+    policiesNew: [],
+    sends: sendResponses,
+    UserDecryption: {
+      MasterPasswordUnlock: userDecryptionOptions.MasterPasswordUnlock,
+      TrustedDeviceOption: null,
+      KeyConnectorOption: null,
+      WebAuthnPrfOption: webAuthnPrfOptions[0] || null,
+      WebAuthnPrfOptions: webAuthnPrfOptions,
+      V2UpgradeToken: null,
+      Object: 'userDecryption',
     },
-    // camelCase for Android client (SyncResponseJson uses @SerialName("userDecryption"))
-    userDecryption: {
-      masterPasswordUnlock: {
-        kdf: {
-          kdfType: user.kdfType,
-          iterations: user.kdfIterations,
-          memory: user.kdfMemory || null,
-          parallelism: user.kdfParallelism || null,
-        },
-        masterKeyWrappedUserKey: user.key,
-        masterKeyEncryptedUserKey: user.key,
-        salt: user.email.toLowerCase(),
-      },
-    },
+    UserDecryptionOptions: userDecryptionOptions,
+    userDecryption: buildUserDecryptionCompat(user) as SyncResponse['userDecryption'],
     object: 'sync',
   };
 
-  const body = JSON.stringify(syncResponse);
-  writeSyncCache(cacheKey, body);
-
-  return new Response(body, {
+  const response = new Response(JSON.stringify(syncResponse), {
     status: 200,
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      'Cache-Control': `private, max-age=${Math.max(1, Math.floor(LIMITS.cache.syncResponseTtlMs / 1000))}`,
+    },
   });
+  await writeSyncCache(cacheRequest, response);
+  return response;
 }

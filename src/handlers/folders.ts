@@ -1,8 +1,46 @@
 import { Env, Folder, FolderResponse } from '../types';
+import {
+  notifyUserFolderCreate,
+  notifyUserFolderDelete,
+  notifyUserFolderUpdate,
+  notifyUserVaultSync,
+} from '../durable/notifications-hub';
 import { StorageService } from '../services/storage';
 import { jsonResponse, errorResponse } from '../utils/response';
+import { readActingDeviceIdentifier } from '../utils/device';
 import { generateUUID } from '../utils/uuid';
 import { parsePagination, encodeContinuationToken } from '../utils/pagination';
+import { auditRequestMetadata, writeAuditEvent } from '../services/audit-events';
+
+function notifyVaultSyncForRequest(
+  request: Request,
+  env: Env,
+  userId: string,
+  revisionDate: string
+): void {
+  notifyUserVaultSync(env, userId, revisionDate, readActingDeviceIdentifier(request));
+}
+
+async function writeFolderAudit(
+  storage: StorageService,
+  request: Request,
+  userId: string,
+  action: string,
+  metadata: Record<string, unknown>
+): Promise<void> {
+  await writeAuditEvent(storage, {
+    actorUserId: userId,
+    action,
+    category: 'data',
+    level: action.includes('delete') ? 'security' : 'info',
+    targetType: 'folder',
+    targetId: typeof metadata.id === 'string' ? metadata.id : null,
+    metadata: {
+      ...metadata,
+      ...auditRequestMetadata(request),
+    },
+  });
+}
 
 // Convert internal folder to API response format
 function folderToResponse(folder: Folder): FolderResponse {
@@ -10,6 +48,7 @@ function folderToResponse(folder: Folder): FolderResponse {
     id: folder.id,
     name: folder.name,
     revisionDate: folder.updatedAt,
+    creationDate: folder.createdAt,
     object: 'folder',
   };
 }
@@ -41,7 +80,7 @@ export async function handleGetFolders(request: Request, env: Env, userId: strin
 // GET /api/folders/:id
 export async function handleGetFolder(request: Request, env: Env, userId: string, id: string): Promise<Response> {
   const storage = new StorageService(env.DB);
-  const folder = await storage.getFolder(id);
+  const folder = await storage.getFolderForUser(id, userId);
 
   if (!folder || folder.userId !== userId) {
     return errorResponse('Folder not found', 404);
@@ -75,7 +114,14 @@ export async function handleCreateFolder(request: Request, env: Env, userId: str
   };
 
   await storage.saveFolder(folder);
-  await storage.updateRevisionDate(userId);
+  const revisionDate = await storage.updateRevisionDate(userId);
+  notifyVaultSyncForRequest(request, env, userId, revisionDate);
+  notifyUserFolderCreate(env, {
+    userId,
+    folderId: folder.id,
+    revisionDate,
+    contextId: readActingDeviceIdentifier(request),
+  });
 
   return jsonResponse(folderToResponse(folder), 200);
 }
@@ -83,7 +129,7 @@ export async function handleCreateFolder(request: Request, env: Env, userId: str
 // PUT /api/folders/:id
 export async function handleUpdateFolder(request: Request, env: Env, userId: string, id: string): Promise<Response> {
   const storage = new StorageService(env.DB);
-  const folder = await storage.getFolder(id);
+  const folder = await storage.getFolderForUser(id, userId);
 
   if (!folder || folder.userId !== userId) {
     return errorResponse('Folder not found', 404);
@@ -102,7 +148,14 @@ export async function handleUpdateFolder(request: Request, env: Env, userId: str
   folder.updatedAt = new Date().toISOString();
 
   await storage.saveFolder(folder);
-  await storage.updateRevisionDate(userId);
+  const revisionDate = await storage.updateRevisionDate(userId);
+  notifyVaultSyncForRequest(request, env, userId, revisionDate);
+  notifyUserFolderUpdate(env, {
+    userId,
+    folderId: folder.id,
+    revisionDate,
+    contextId: readActingDeviceIdentifier(request),
+  });
 
   return jsonResponse(folderToResponse(folder));
 }
@@ -110,7 +163,7 @@ export async function handleUpdateFolder(request: Request, env: Env, userId: str
 // DELETE /api/folders/:id
 export async function handleDeleteFolder(request: Request, env: Env, userId: string, id: string): Promise<Response> {
   const storage = new StorageService(env.DB);
-  const folder = await storage.getFolder(id);
+  const folder = await storage.getFolderForUser(id, userId);
 
   if (!folder || folder.userId !== userId) {
     return errorResponse('Folder not found', 404);
@@ -118,7 +171,58 @@ export async function handleDeleteFolder(request: Request, env: Env, userId: str
 
   await storage.clearFolderFromCiphers(userId, id);
   await storage.deleteFolder(id, userId);
-  await storage.updateRevisionDate(userId);
+  const revisionDate = await storage.updateRevisionDate(userId);
+  notifyVaultSyncForRequest(request, env, userId, revisionDate);
+  notifyUserFolderDelete(env, {
+    userId,
+    folderId: id,
+    revisionDate,
+    contextId: readActingDeviceIdentifier(request),
+  });
+  await writeFolderAudit(storage, request, userId, 'folder.delete', {
+    id,
+  });
+
+  return new Response(null, { status: 204 });
+}
+
+// POST /api/folders/delete
+export async function handleBulkDeleteFolders(request: Request, env: Env, userId: string): Promise<Response> {
+  const storage = new StorageService(env.DB);
+
+  let body: { ids?: string[] };
+  try {
+    body = await request.json();
+  } catch {
+    return errorResponse('Invalid JSON', 400);
+  }
+
+  const ids = Array.isArray(body.ids) ? body.ids.map((id) => String(id || '').trim()).filter(Boolean) : [];
+  if (!ids.length) {
+    return errorResponse('Folder ids are required', 400);
+  }
+
+  const folders = (
+    await Promise.all(ids.map(async (id) => {
+      const folder = await storage.getFolderForUser(id, userId);
+      return folder;
+    }))
+  ).filter((folder): folder is Folder => !!folder);
+  const revisionDate = await storage.bulkDeleteFolders(ids, userId);
+  if (revisionDate) {
+    notifyVaultSyncForRequest(request, env, userId, revisionDate);
+    for (const folder of folders) {
+      notifyUserFolderDelete(env, {
+        userId,
+        folderId: folder.id,
+        revisionDate,
+        contextId: readActingDeviceIdentifier(request),
+      });
+    }
+    await writeFolderAudit(storage, request, userId, 'folder.delete.bulk', {
+      count: ids.length,
+    });
+  }
 
   return new Response(null, { status: 204 });
 }
